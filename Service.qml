@@ -1,132 +1,320 @@
-// Notification service for the omarchy shell.
+// stock omarchy.notifications (4.0.4) underneath: history files, dnd, click actions
+// and ipc names untouched so omarchy's own binds keep working
 
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import Quickshell.Hyprland
 import Quickshell.Services.Notifications
 import qs.Commons
 
 import "components"
 import "NotificationLogic.js" as NotificationLogic
+import "Model.js" as Model
 
 Item {
   id: service
 
-  // Injected by omarchy-shell (the first-party service loader).
   property var shell: null
 
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   readonly property string home: Quickshell.env("HOME")
-  // History + DND live under XDG_STATE_HOME: they're persistent user state
-  // (the notifications received, the last-set DND preference), not
-  // regeneratable cache that a `rm -rf ~/.cache` should wipe.
+  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/+$/, "")
   readonly property string stateDir: home + "/.local/state/omarchy/"
   readonly property string settingsPath: stateDir + "notifications.json"
-  // One file per on-screen popup, so live toasts survive shell restarts.
-  // A file exists exactly as long as its popup is showing: written when the
-  // toast appears, moved into historyDir when it expires, is dismissed, or is
-  // acted upon.
   readonly property string popupStateDir: stateDir + "notifications/"
-  // The notifications that already left the screen, one file each, trimmed to
-  // the newest historyLimit. This directory IS the history: `showHistory`
-  // replays exactly what has been moved in here.
   readonly property string historyDir: popupStateDir + "history/"
-  // Copies of the avatars/images persisted entries reference — the sender's
-  // originals don't outlive the notification (see persistablePopup). Each
-  // copy lives and dies with the JSON file whose stem it carries.
   readonly property string imagesDir: popupStateDir + "images/"
-  // Corner radius is shared with the menu and shell panels.
-  // It mirrors Hyprland's current decoration:rounding value.
-  readonly property int cornerRadius: Style.cornerRadius
-  // Toasts are fixed to the top-right corner. They only clear the omarchy bar
-  // when the bar occupies the top or right edge, so left/bottom bars do not
-  // pull notification popups away from the expected top-right location.
-  // Falls back to the bar's default size (26 horizontal / 28 vertical) when
-  // shell.bar isn't reachable so the popup never lands on top of the bar.
+  readonly property string cfgPath: home + "/.config/omarchy/notifications.json"
+  readonly property string faviconDir: home + "/.cache/eduardo-notifications/favicons/"
+  readonly property string stockDir: "/usr/share/omarchy/shell/plugins/notifications"
+
   readonly property string barPosition: shell && shell.barConfig ? String(shell.barConfig.position || "top") : "top"
   readonly property bool barVertical: barPosition === "left" || barPosition === "right"
   readonly property int defaultBarSize: barVertical ? Style.bar.sizeVertical : Style.bar.sizeHorizontal
   readonly property int liveBarSize: shell && shell.bar && !shell.bar.barHidden ? Math.max(0, shell.bar.barSize) : defaultBarSize
   readonly property int barClearance: liveBarSize + Style.gapsOut
 
-  // Live Notification objects by originalId, kept OUT of the ListModels: a
-  // QObject stored in a model role becomes a dangling C++ pointer when the
-  // server destroys the notification (sender close, DND untrack, dismiss),
-  // and the next read of that role segfaults in QQmlListModel::data. A JS
-  // map only holds a wrapper, which degrades to a catchable error instead.
   property var liveRefs: ({})
 
-  // PersistentProperties handles in-process QML reloads. The on-disk
-  // notifications.json file is the cross-restart backstop — its `dnd` key
-  // is hydrated into persisted.doNotDisturb on startup and written back via
-  // a debounced save timer.
+
+  property var cfg: Model.normalizeSettings({})
+  property bool cfgLoaded: false
+
+  Theme {
+    id: glassTheme
+    glassOpacity: service.cfg.glassOpacity / 100
+  }
+
+  FileView {
+    id: cfgFile
+    path: service.cfgPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: service.adoptSettings(Model.parseSettingsText(text()))
+    onLoadFailed: service.adoptSettings(Model.normalizeSettings({}))
+  }
+
+  Timer {
+    id: cfgSaveTimer
+    interval: 250
+    onTriggered: cfgFile.setText(Model.serializeSettings(service.cfg))
+  }
+
+  function adoptSettings(next) {
+    var hyprChanged = cfgLoaded && next.blur !== cfg.blur
+    cfg = next
+    cfgLoaded = true
+    if (hyprChanged) applyHypr(cfg.shortcut, true)
+  }
+
+  function updateSettings(patch) {
+    var next = {}
+    for (var k in cfg) next[k] = cfg[k]
+    for (var p in patch) next[p] = patch[p]
+    var normalized = Model.normalizeSettings(next)
+    var blurChanged = normalized.blur !== cfg.blur
+    cfg = normalized
+    cfgSaveTimer.restart()
+    if (blurChanged) applyHypr(cfg.shortcut, true)
+    if (patch.rules !== undefined || patch.siteIcons !== undefined || patch.hideAfter !== undefined
+        || patch.critical !== undefined) redecorate()
+  }
+
+  function setRule(key, label, patch) {
+    var rules = cfg.rules.slice()
+    var found = -1
+    for (var i = 0; i < rules.length; i++) if (rules[i].app === key) found = i
+    var rule = found >= 0 ? Object.assign({}, rules[found]) : { app: key, label: label, mode: "normal", hideBody: false }
+    for (var p in patch) rule[p] = patch[p]
+    if (found >= 0) rules[found] = rule
+    else rules.push(rule)
+    rules = rules.filter(function(r) { return r.mode !== "normal" || r.hideBody })
+    updateSettings({ rules: rules })
+  }
+
+
+  property string shortcutStatus: ""
+  property bool shortcutConflict: false
+  property string pendingShortcut: ""
+
+  function applyShortcut(chord, force) {
+    if (!chord) return
+    pendingShortcut = chord
+    shortcutStatus = "checking…"
+    shortcutConflict = false
+    applyHypr(chord, force)
+  }
+
+  function applyHypr(chord, force) {
+    var argv = [pluginDir + "/bin/eduardo-notifications-hypr", "apply", "--shortcut", chord, "--blur", cfg.blur ? "1" : "0"]
+    if (force) argv.push("--force")
+    hyprProc.command = argv
+    hyprProc.running = true
+  }
+
+  Process {
+    id: hyprProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: service.hyprDone(text)
+    }
+  }
+
+  function hyprDone(raw) {
+    var res = {}
+    try { res = JSON.parse(String(raw || "").trim() || "{}") } catch (e) { res = { ok: false, error: "helper failed" } }
+    if (res.ok) {
+      shortcutStatus = ""
+      shortcutConflict = false
+      if (res.shortcut && res.shortcut !== cfg.shortcut) updateSettings({ shortcut: res.shortcut })
+    } else if (res.conflict) {
+      shortcutStatus = "used by: " + res.conflict
+      shortcutConflict = true
+    } else {
+      shortcutStatus = res.error || "couldn't apply"
+      shortcutConflict = false
+    }
+  }
+
+
   PersistentProperties {
     id: persisted
-    reloadableId: "omarchy-notifications"
+    reloadableId: "eduardo-notifications"
     property bool doNotDisturb: false
     onDoNotDisturbChanged: {
-      // Suppress the write that load-time hydration would otherwise trigger.
       if (service._hydrating) return
       service.scheduleSettingsSave()
     }
   }
 
-  // Guards onDoNotDisturbChanged while we're hydrating from disk so the
-  // hydration assignment doesn't immediately schedule a write-back.
   property bool _hydrating: false
-
   readonly property alias doNotDisturb: persisted.doNotDisturb
 
   function setDoNotDisturb(value) {
     persisted.doNotDisturb = !!value
   }
 
-  // popupModel feeds the on-screen toast stack — the only model the service
-  // keeps. Everything a toast leaves behind lives on disk under historyDir.
-  //
-  // Aliased as a property so consumers outside this Item's id scope can bind
-  // to it. QML ids aren't visible to external consumers without the alias.
-  property alias popupModel: popupModel
-  ListModel { id: popupModel }
+  property var scheduleState: null
 
-  // How many notifications the history directory keeps, and therefore how
-  // many `showHistory` can replay.
-  readonly property int historyLimit: 10
-
-  readonly property int lowPopupDuration: 5000
-  readonly property int normalPopupDuration: 8000
-  readonly property int maxPopupDuration: 30000
-
-  function durationFor(urgency, expireTimeout) {
-    switch (urgency) {
-    case NotificationUrgency.Critical:
-      return 0
-    case NotificationUrgency.Low:
-      return Math.min(maxPopupDuration, Math.max(lowPopupDuration, requestedDuration(expireTimeout)))
-    default:
-      return Math.min(maxPopupDuration, Math.max(normalPopupDuration, requestedDuration(expireTimeout)))
+  Timer {
+    interval: 30000
+    repeat: true
+    triggeredOnStart: true
+    running: service.cfgLoaded && service.cfg.dndSchedule.enabled
+    onRunningChanged: if (!running) service.scheduleState = null
+    onTriggered: {
+      var d = new Date()
+      var inside = Model.inWindow(d.getHours() * 60 + d.getMinutes(), service.cfg.dndSchedule.from, service.cfg.dndSchedule.to)
+      if (service.scheduleState !== inside && (service.scheduleState !== null || inside)) service.setDoNotDisturb(inside)
+      service.scheduleState = inside
     }
   }
 
+  function fullscreenNow() {
+    var m = Hyprland.focusedMonitor
+    return !!(m && m.activeWorkspace && m.activeWorkspace.hasFullscreen)
+  }
+
+
+  property var webapps: ({})
+  property var faviconState: ({})
+  property var faviconRev: ({})
+  property var faviconQueue: []
+
+  Process {
+    id: webappsProc
+    command: [service.pluginDir + "/bin/eduardo-notifications-webapps"]
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { service.webapps = JSON.parse(text || "{}") } catch (e) { service.webapps = {} }
+        service.redecorate()
+      }
+    }
+  }
+
+  function siteIconFor(ident) {
+    if (!ident.host) return ""
+    if (ident.icon) return ident.icon
+    ensureFavicon(ident.host)
+    var rev = faviconRev[ident.host]
+    return "file://" + faviconDir + ident.host + ".png" + (rev ? "?v=" + rev : "")
+  }
+
+  function ensureFavicon(host) {
+    if (faviconState[host]) return
+    faviconState[host] = "pending"
+    faviconQueue = faviconQueue.concat([host])
+    nextFavicon()
+  }
+
+  function nextFavicon() {
+    if (faviconProc.running || faviconQueue.length === 0) return
+    var host = faviconQueue[0]
+    faviconQueue = faviconQueue.slice(1)
+    faviconProc.host = host
+    faviconProc.command = [pluginDir + "/bin/eduardo-notifications-favicon", host, faviconDir + host + ".png"]
+    faviconProc.running = true
+  }
+
+  Process {
+    id: faviconProc
+    property string host: ""
+    running: false
+    onExited: function(exitCode) {
+      var host = faviconProc.host
+      service.faviconState[host] = exitCode === 0 ? "done" : "failed"
+      if (exitCode === 0) {
+        var revs = {}
+        for (var k in service.faviconRev) revs[k] = service.faviconRev[k]
+        revs[host] = Date.now()
+        service.faviconRev = revs
+        service.redecorate()
+      }
+      service.nextFavicon()
+    }
+  }
+
+  function identityOf(entry) {
+    return Model.identify(entry, webapps, cfg.siteIcons)
+  }
+
+  function rowOf(e, now, live) {
+    var ident = identityOf(e)
+    var rule = Model.ruleFor(cfg.rules, ident.key)
+    var lifetime = live ? durationFor(e.urgency, e.expireTimeout) : 0
+    return {
+      id: e.id || 0,
+      originalId: e.originalId || e.id || 0,
+      app: String(e.app || ""),
+      appIcon: String(e.appIcon || ""),
+      summary: String(e.summary || ""),
+      body: String(e.body || ""),
+      image: String(e.image || ""),
+      glyph: String(e.glyph || ""),
+      execArgv: String(e.execArgv || ""),
+      urgency: typeof e.urgency === "number" ? e.urgency : NotificationUrgency.Normal,
+      expireTimeout: Number(e.expireTimeout || 0),
+      timestamp: Number(e.timestamp || 0),
+      stem: NotificationLogic.imageStem(e),
+      appKey: ident.key,
+      appLabel: ident.label,
+      siteIcon: siteIconFor(ident),
+      hideBody: !!(rule && rule.hideBody),
+      repeat: 1,
+      lifetime: lifetime,
+      deadline: lifetime > 0 ? now + lifetime : 0,
+      leaving: false,
+      live: !!live
+    }
+  }
+
+  // identity, site icons and rules can change after a row exists
+  function redecorate() {
+    var models = [popupModel, centerModel]
+    for (var m = 0; m < models.length; m++) {
+      var model = models[m]
+      for (var i = 0; i < model.count; i++) {
+        var row = model.get(i)
+        if (!row) continue
+        var ident = identityOf(row)
+        var rule = Model.ruleFor(cfg.rules, ident.key)
+        var icon = siteIconFor(ident)
+        if (row.appKey !== ident.key) model.setProperty(i, "appKey", ident.key)
+        if (row.appLabel !== ident.label) model.setProperty(i, "appLabel", ident.label)
+        if (row.siteIcon !== icon) model.setProperty(i, "siteIcon", icon)
+        if (row.hideBody !== !!(rule && rule.hideBody)) model.setProperty(i, "hideBody", !!(rule && rule.hideBody))
+      }
+    }
+    refreshKnownApps()
+  }
+
+
+  property alias popupModel: popupModel
+  ListModel { id: popupModel }
+
+  readonly property int historyLimit: cfg.keepHistory
+  readonly property int maxPopupDuration: 120000
+
+  function durationFor(urgency, expireTimeout) {
+    var base = cfg.hideAfter * 1000
+    if (urgency === NotificationUrgency.Critical) return cfg.critical === "stay" ? 0 : base * 2
+    return Math.min(maxPopupDuration, Math.max(base, requestedDuration(expireTimeout)))
+  }
+
   function requestedDuration(expireTimeout) {
-    // FreeDesktop notification spec (and Quickshell) report expireTimeout in
-    // milliseconds, so pass it through directly.
     var ms = Number(expireTimeout || 0)
     if (!isFinite(ms) || ms <= 0) return 0
     return Math.round(ms)
   }
 
-  // DND bypass: only let through notifications we trust to be intentional
-  // and rare.
-  //   - omarchy-action: a user-action confirmation toast ("Theme changed",
-  //     "Screenshot saved"). The user JUST did something — their feedback
-  //     should show.
-  //   - urgency=critical AND app_name=notify-send: bare-CLI emergency alerts.
-  //     Trusted because it's almost always omarchy or system shell scripts —
-  //     chat apps set app_name to their brand (Discord/Slack/Vesktop), which
-  //     falls outside this rule.
   function shouldBypassDnd(notification) {
     return NotificationLogic.shouldBypassDnd(notification, NotificationUrgency.Critical)
   }
@@ -135,16 +323,6 @@ Item {
     return NotificationLogic.snapshotOf(notification, Date.now())
   }
 
-  // A notification nobody looks back at:
-  //   - the freedesktop `transient` hint is set ("popup only, don't store")
-  //   - app_name is "notify-send" (the CLI default — means the sender
-  //     didn't bother declaring an identity, so it's almost certainly
-  //     ephemeral test/feedback noise)
-  //   - app_name is "omarchy-action" (Omarchy's own user-action toasts —
-  //     the user just triggered them)
-  // Their toasts still land in history like any other once they've been on
-  // screen; the distinction only decides whether a DND-silenced one is worth
-  // recording at all.
   function isEphemeral(notification) {
     var transient = false
     try {
@@ -153,29 +331,57 @@ Item {
     return transient || NotificationLogic.isEphemeralApp(String(notification.appName || ""))
   }
 
+  function indexByStem(model, stem) {
+    for (var i = 0; i < model.count; i++) {
+      var row = model.get(i)
+      if (row && row.stem === stem) return i
+    }
+    return -1
+  }
+
+  function firstActiveIndex() {
+    for (var i = 0; i < popupModel.count; i++) {
+      var row = popupModel.get(i)
+      if (row && !row.leaving) return i
+    }
+    return -1
+  }
+
+  function findDuplicate(appKey, snapshot) {
+    var probe = { appKey: appKey, summary: snapshot.summary, body: snapshot.body }
+    for (var i = 0; i < popupModel.count; i++) {
+      var row = popupModel.get(i)
+      if (row && !row.leaving && row.originalId !== snapshot.originalId && Model.isDuplicate(row, probe)) return i
+    }
+    return -1
+  }
+
   function handleNotification(notification) {
-    // Without `tracked = true` the Notification object is destroyed as soon
-    // as this signal handler returns, which would null out the `ref` we just
-    // captured for the popup card.
     notification.tracked = true
     var snapshot = snapshotOf(notification)
     liveRefs[snapshot.originalId] = notification
-    // Guard the delete: a newer notification may have reused this originalId
-    // (freedesktop replaces_id) and taken over the map slot.
     notification.closed.connect(function() {
       if (service.liveRefs[snapshot.originalId] === notification)
         delete service.liveRefs[snapshot.originalId]
     })
 
-    // DND bypass rules: chat apps abuse urgency=critical to force
-    // visibility, so critical alone isn't enough — we also require the
-    // sender to be CLI-style. See shouldBypassDnd().
-    if (service.doNotDisturb && !shouldBypassDnd(notification)) {
-      // The toast never shows, so the only record a silenced notification
-      // can leave is a history entry. Write it straight into history —
-      // "what did I miss while silenced" is exactly what history is for.
+    var ident = identityOf(snapshot)
+    var rule = Model.ruleFor(cfg.rules, ident.key)
+    var bypass = shouldBypassDnd(notification)
+
+    if (rule && rule.mode === "mute" && !bypass) {
+      delete liveRefs[snapshot.originalId]
+      notification.tracked = false
+      return
+    }
+
+    var silenced = !bypass && (service.doNotDisturb || (rule && rule.mode === "center")
+      || (cfg.silenceFullscreen && fullscreenNow()))
+    if (silenced) {
       if (!isEphemeral(notification)) {
+        noteUnread(snapshot, notification)
         writeSilenced(notification, snapshot)
+        if (centerOpen) refreshCenter()
         return
       }
       delete liveRefs[snapshot.originalId]
@@ -183,32 +389,36 @@ Item {
       return
     }
 
+    if (cfg.collapseDuplicates) {
+      var dup = findDuplicate(ident.key, snapshot)
+      if (dup >= 0) {
+        var existing = popupModel.get(dup)
+        popupModel.setProperty(dup, "repeat", (existing.repeat || 1) + 1)
+        if (existing.lifetime > 0) popupModel.setProperty(dup, "deadline", Date.now() + existing.lifetime)
+        clearExtra(existing.stem)
+        delete liveRefs[snapshot.originalId]
+        notification.tracked = false
+        return
+      }
+    }
+
+    noteUnread(snapshot, notification)
     persistPopupFile(snapshot)
     watchForUpdates(notification, snapshot)
-    // Qt.callLater avoids "QV4::Object::insertMember" crashes when a
-    // Repeater is mid-incubation while we mutate its model.
     Qt.callLater(function() {
       removePopupsByOriginalId(snapshot.originalId, NotificationLogic.popupFileName(snapshot))
-      popupModel.insert(0, snapshot)
-      // An update that arrived while the insert was deferred found no row to
-      // write to, and a property that already changed will not change again.
-      // Reading the object once the row exists catches up on it.
+      popupModel.insert(0, service.rowOf(snapshot, Date.now(), true))
       service.refreshPopup(notification, snapshot.originalId, snapshot.timestamp)
+      if (service.centerOpen) service.refreshCenter()
     })
   }
 
-  // Persist a silenced notification, held tracked until its content is
-  // stable: untracking tells the sender its notification closed (Chromium
-  // then deletes its avatar file), and a replaces_id update lands on this
-  // object without a second onNotification — releasing on a stale snapshot
-  // would drop it. Each catch-up write reuses the original file identity.
   function writeSilenced(notification, written) {
     writeHistoryFile(written, function() {
       var updated = null
       try {
         updated = NotificationLogic.replacementSnapshot(notification, written.originalId, written.timestamp)
       } catch (e) {
-        // Torn down by the server while the write was queued.
       }
       if (updated && NotificationLogic.popupRowChanged(written, updated)) {
         service.writeSilenced(notification, updated)
@@ -218,30 +428,19 @@ Item {
     })
   }
 
-  // Let go of a DND-silenced notification once its history write has run.
-  // The id may have been reused and the object torn down meanwhile.
   function releaseSilenced(notification, originalId) {
     if (liveRefs[originalId] === notification) delete liveRefs[originalId]
     try {
       notification.tracked = false
     } catch (e) {
-      // Object already destroyed by the server — nothing left to release.
     }
   }
 
-  // Everything the card draws. A change to any of these is a client updating
-  // the notification in place, which is the only kind of update we ever hear
-  // about after the popup exists.
   readonly property var updateSignals: [
     "summaryChanged", "bodyChanged", "appNameChanged", "appIconChanged",
     "imageChanged", "urgencyChanged", "expireTimeoutChanged", "hintsChanged"
   ]
 
-  // A client that updates a notification through replaces_id does not produce
-  // a second onNotification: the server writes the new content onto the object
-  // we are already holding. The card draws a snapshot copied out of that
-  // object — deliberately, since the object itself must stay out of the model
-  // — so nothing reaches the screen until we copy it again.
   function watchForUpdates(notification, snapshot) {
     function refresh() {
       service.refreshPopup(notification, snapshot.originalId, snapshot.timestamp)
@@ -254,88 +453,71 @@ Item {
   }
 
   function refreshPopup(notification, originalId, timestamp) {
-    // A newer notification may have taken this id over, and the object may
-    // outlive its popup — in both cases there is nothing here to refresh.
     if (service.liveRefs[originalId] !== notification) return
 
     var updated
     try {
       updated = NotificationLogic.replacementSnapshot(notification, originalId, timestamp)
     } catch (e) {
-      // Object torn down by the server while the signal was in flight.
       return
     }
 
     var roles = NotificationLogic.popupRoles()
     for (var i = 0; i < popupModel.count; i++) {
       var row = popupModel.get(i)
-      if (!row || row.originalId !== originalId || row.timestamp !== timestamp) continue
+      if (!row || row.originalId !== originalId || row.timestamp !== timestamp || row.leaving) continue
       if (!NotificationLogic.popupRowChanged(row, updated)) return
+      var contentChanged = row.summary !== updated.summary || row.body !== updated.body || row.image !== updated.image
       for (var r = 0; r < roles.length; r++) popupModel.setProperty(i, roles[r], updated[roles[r]])
-      // The file name is the timestamp and id this popup was persisted under,
-      // so the rewrite lands on the same file: a restart restores the version
-      // last shown, and so does the copy that ends up in history.
+      var fresh = rowOf(updated, Date.now(), true)
+      popupModel.setProperty(i, "appKey", fresh.appKey)
+      popupModel.setProperty(i, "appLabel", fresh.appLabel)
+      popupModel.setProperty(i, "siteIcon", fresh.siteIcon)
+      popupModel.setProperty(i, "lifetime", fresh.lifetime)
+      if (contentChanged) {
+        popupModel.setProperty(i, "deadline", fresh.deadline)
+        clearExtra(row.stem)
+      }
       persistPopupFile(updated)
       return
     }
   }
 
-  // A restored row carries an id from the previous server generation, and
-  // the new server hands out ids from 1 again — so a fresh notification
-  // with the same originalId is a coincidence, not the same notification.
-  // The timestamp (via the file name) disambiguates: it travels with the
-  // row through every model and file round-trip.
   function isRestoredRow(row) {
     return !!row && !!restoredPopups[NotificationLogic.popupFileName(row)]
   }
 
-  // A notification arriving under an originalId a popup on screen already
-  // holds supersedes it, so that row leaves the screen. Its file is deleted
-  // rather than archived: the row taking its place archives itself when it
-  // goes, and history would otherwise hold two entries for what the sender
-  // means as one notification.
-  // keepFileName is the replacement's own file: a same-millisecond
-  // replacement shares the replaced row's filename, and the new write is
-  // already queued — deleting that path here would erase the replacement's
-  // only file.
   function removePopupsByOriginalId(originalId, keepFileName) {
     for (var i = popupModel.count - 1; i >= 0; i--) {
       var row = popupModel.get(i)
       if (!row || row.originalId !== originalId) continue
-      // Not a replaces_id match — see isRestoredRow. Removing it here
-      // would silently kill a restored critical alert on an unrelated ping.
       if (isRestoredRow(row)) continue
       if (NotificationLogic.popupFileName(row) !== keepFileName) deletePopupFileFor(row)
+      clearExtra(row.stem)
       popupModel.remove(i)
     }
   }
 
   function dismissPopup(index) {
-    removePopup(index, "dismiss")
+    removePopup(index, "dismiss", true)
   }
 
   function expirePopup(index) {
-    removePopup(index, "expire")
+    removePopup(index, "expire", true)
   }
 
-  function removePopup(index, reason) {
+  function removePopup(index, reason, archive) {
     if (index < 0 || index >= popupModel.count) return
     var entry = popupModel.get(index)
-    var originalId = entry ? entry.originalId : -1
-    // A restored row has no live server object, and its old-generation id
-    // may meanwhile belong to a fresh notification — resolving liveRefs by
-    // id would dismiss that unrelated notification at the server.
+    if (!entry || entry.leaving) return
+    var originalId = entry.originalId
     var restored = isRestoredRow(entry)
     var ref = !restored && originalId >= 0 ? liveRefs[originalId] : null
-    // The popup is leaving the screen — for any reason — so its file must not
-    // survive to the next shell restart. It becomes the newest history entry
-    // instead. Rows that never had a file (a history replay, the empty-history
-    // placeholder) archive to nothing, which the move tolerates.
-    if (entry) {
-      archivePopupFileFor(entry)
-      if (restored) delete restoredPopups[NotificationLogic.popupFileName(entry)]
-    }
-    popupModel.remove(index)
+    if (archive) archivePopupFileFor(entry)
+    else deletePopupFileFor(entry)
+    if (restored) delete restoredPopups[NotificationLogic.popupFileName(entry)]
+    clearExtra(entry.stem)
+    beginLeave(popupModel, index)
     if (ref) {
       try {
         if (ref.tracked) {
@@ -343,35 +525,30 @@ Item {
           else ref.dismiss()
         }
       } catch (e) {
-        // Object already torn down by the server — nothing to dismiss.
       }
+    }
+    if (centerOpen) refreshCenter()
+  }
+
+  function clearPopups(archive) {
+    for (var i = popupModel.count - 1; i >= 0; i--) {
+      var row = popupModel.get(i)
+      if (row && !row.leaving) removePopup(i, "dismiss", archive !== false)
     }
   }
 
-  function clearPopups() {
-    while (popupModel.count > 0) dismissPopup(0)
-  }
-
-  // Run the popup's click action, then dismiss. Omarchy's own toasts carry the
-  // action as an argv vector in the `execArgv` role (see execArgvFromHints),
-  // which the persistence files preserve, so restored toasts stay clickable.
-  // Third-party clients register a libnotify action under the canonical
-  // identifier "default" instead; that one only works while the sender is live.
   function invokePopupDefault(index) {
     if (index < 0 || index >= popupModel.count) return
     var entry = popupModel.get(index)
+    if (!entry || entry.leaving) return
 
-    // Run the argv (via Util.execArgv, no shell interpretation). Detached so it
-    // outlives the shell, which installer toasts depend on: they restart it.
-    var argv = NotificationLogic.parseExecArgv(entry ? entry.execArgv : "")
+    var argv = NotificationLogic.parseExecArgv(entry.execArgv)
     if (argv) {
       Util.execArgv(argv)
       dismissPopup(index)
       return
     }
-    // Restored rows have no live actions, and looking up liveRefs by their
-    // old-generation id could fire an unrelated fresh notification's action.
-    var ref = entry && !isRestoredRow(entry) ? liveRefs[entry.originalId] : null
+    var ref = !isRestoredRow(entry) ? liveRefs[entry.originalId] : null
     var invoked = false
     try {
       if (ref && ref.actions) {
@@ -385,59 +562,381 @@ Item {
         }
       }
     } catch (e) {
-      // Notification already torn down by the server — fall through to focus.
       console.warn("invoke default failed:", e)
     }
-    // Chat apps (Slack, Discord, Vesktop, etc.) rarely register a "default"
-    // libnotify action — they just expect clicking the notification to
-    // focus their window. Fall back to focusing the sending app by class so
-    // that click-to-jump actually works.
     if (!invoked) focusApp(entry)
     dismissPopup(index)
   }
 
-  // Try to focus an existing Hyprland window matching the notification's
-  // sender. The helper handles case-insensitive class matching.
   function focusApp(entry) {
     if (!entry || !entry.app) return
-    focusAppProc.command = [
-      service.omarchyPath + "/bin/omarchy-hyprland-focus-app",
-      String(entry.app)
-    ]
+    focusAppProc.command = [service.omarchyPath + "/bin/omarchy-hyprland-focus-app", String(entry.app)]
     focusAppProc.running = true
   }
 
   Process { id: focusAppProc; running: false }
 
+
+  property var leaveQueue: []
+
+  function beginLeave(model, index) {
+    var row = model.get(index)
+    if (!row || row.leaving) return
+    model.setProperty(index, "leaving", true)
+    leaveQueue = leaveQueue.concat([{ model: model, stem: row.stem, at: Date.now() + 190 }])
+    leaveTimer.start()
+  }
+
+  Timer {
+    id: leaveTimer
+    interval: 60
+    repeat: true
+    onTriggered: {
+      var t = Date.now()
+      var keep = []
+      for (var i = 0; i < service.leaveQueue.length; i++) {
+        var job = service.leaveQueue[i]
+        if (job.at > t) {
+          keep.push(job)
+          continue
+        }
+        var idx = service.indexByStem(job.model, job.stem)
+        if (idx >= 0 && job.model.get(idx).leaving) job.model.remove(idx)
+      }
+      service.leaveQueue = keep
+      if (keep.length === 0) stop()
+    }
+  }
+
+
+  property double now: Date.now()
+  property double lastTick: 0
+  property var extraMs: ({})
+  property bool toastHovered: false
+  property var toastExpanded: ({})
+  property int activePopups: 0
+
+  function recountPopups() {
+    var n = 0
+    for (var i = 0; i < popupModel.count; i++) {
+      var row = popupModel.get(i)
+      if (row && !row.leaving) n++
+    }
+    activePopups = n
+  }
+
+  Connections {
+    target: popupModel
+    function onCountChanged() { service.recountPopups() }
+    function onDataChanged() { service.recountPopups() }
+  }
+
+  function clearExtra(stem) {
+    if (extraMs[stem] === undefined) return
+    var next = {}
+    for (var k in extraMs) if (k !== stem) next[k] = extraMs[k]
+    extraMs = next
+  }
+
+  function toggleToastGroup(key) {
+    var next = {}
+    for (var k in toastExpanded) next[k] = toastExpanded[k]
+    if (next[key]) delete next[key]
+    else next[key] = true
+    toastExpanded = next
+  }
+
+  Timer {
+    interval: service.activePopups > 0 ? 50 : 1000
+    repeat: true
+    running: service.activePopups > 0 || service.centerOpen
+    onRunningChanged: service.lastTick = 0
+    onTriggered: service.tick()
+  }
+
+  function tick() {
+    var t = Date.now()
+    var dt = lastTick > 0 ? Math.min(1000, t - lastTick) : 0
+    lastTick = t
+    now = t
+
+    var rows = []
+    var idx = []
+    for (var i = 0; i < popupModel.count; i++) {
+      var r = popupModel.get(i)
+      if (!r || r.leaving) continue
+      rows.push({ appKey: r.appKey })
+      idx.push(i)
+    }
+    if (idx.length === 0) return
+
+    var running = {}
+    var paused = centerOpen || (cfg.pauseOnHover && toastHovered)
+    if (!paused) {
+      var groups = Model.groupRows(rows, cfg.groupByApp)
+      for (var g = 0; g < groups.length && g < cfg.maxOnScreen; g++) {
+        var grp = groups[g]
+        if (grp.indices.length > 1 && toastExpanded[grp.key]) {
+          for (var k = 0; k < grp.indices.length; k++) running[idx[grp.indices[k]]] = true
+        } else {
+          running[idx[grp.indices[0]]] = true
+        }
+      }
+    }
+
+    var next = {}
+    for (var key in extraMs) next[key] = extraMs[key]
+    var expired = []
+    for (var j = 0; j < idx.length; j++) {
+      var row = popupModel.get(idx[j])
+      if (!(row.lifetime > 0)) continue
+      if (!running[idx[j]]) {
+        next[row.stem] = (next[row.stem] || 0) + dt
+        continue
+      }
+      if (t >= row.deadline + (next[row.stem] || 0)) expired.push(row.stem)
+    }
+    extraMs = next
+    for (var e = 0; e < expired.length; e++) {
+      var at = indexByStem(popupModel, expired[e])
+      if (at >= 0) expirePopup(at)
+    }
+  }
+
+
+  property var snoozed: []
+
+  function snoozePopup(index) {
+    var row = popupModel.get(index)
+    if (!row || row.leaving) return
+    var entry = {
+      id: row.id, originalId: row.originalId, app: row.app, appIcon: row.appIcon, summary: row.summary,
+      body: row.body, image: row.image, glyph: row.glyph, execArgv: row.execArgv, urgency: row.urgency,
+      expireTimeout: row.expireTimeout, timestamp: row.timestamp
+    }
+    var kept = NotificationLogic.persistablePopup(entry, imagesDir).entry
+    removePopup(index, "dismiss", true)
+    snoozed = snoozed.concat([{ entry: kept, at: Date.now() + cfg.snoozeMinutes * 60000 }])
+  }
+
+  Timer {
+    interval: 15000
+    repeat: true
+    running: service.snoozed.length > 0
+    onTriggered: {
+      var t = Date.now()
+      var keep = []
+      for (var i = 0; i < service.snoozed.length; i++) {
+        var s = service.snoozed[i]
+        if (s.at > t) {
+          keep.push(s)
+          continue
+        }
+        service.restoredPopups[NotificationLogic.popupFileName(s.entry)] = true
+        service.persistPopupFile(s.entry)
+        service.noteUnread(s.entry, null)
+        popupModel.insert(0, service.rowOf(s.entry, t, true))
+      }
+      service.snoozed = keep
+    }
+  }
+
+
+  property int unread: 0
+  property bool unreadCritical: false
+  property double lastSeen: 0
+
+  function noteUnread(snapshot, notification) {
+    if (centerOpen) return
+    if (notification && isEphemeral(notification)) return
+    if (!notification && NotificationLogic.isEphemeralApp(String(snapshot.app || ""))) return
+    unread++
+    if (snapshot.urgency === NotificationUrgency.Critical) unreadCritical = true
+  }
+
+  property bool centerOpen: false
+  property string centerScreenName: ""
+  property var centerExpanded: ({})
+  property var knownApps: []
+  property int centerCount: 0
+  property real centerProgress: centerOpen ? 1 : 0
+  readonly property bool centerVisible: centerOpen || centerProgress > 0.001
+
+  Behavior on centerProgress {
+    NumberAnimation {
+      duration: service.centerOpen ? 220 : 140
+      easing.type: service.centerOpen ? Easing.OutCubic : Easing.InCubic
+    }
+  }
+
+  property alias centerModel: centerModel
+  ListModel { id: centerModel }
+
+  Connections {
+    target: centerModel
+    function onCountChanged() { service.recountCenter() }
+    function onDataChanged() { service.recountCenter() }
+  }
+
+  function recountCenter() {
+    var n = 0
+    for (var i = 0; i < centerModel.count; i++) {
+      var row = centerModel.get(i)
+      if (row && !row.leaving) n++
+    }
+    centerCount = n
+  }
+
+  function openCenter() {
+    if (centerOpen) return
+    centerScreenName = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+    centerOpen = true
+    unread = 0
+    unreadCritical = false
+    lastSeen = Date.now()
+    scheduleSettingsSave()
+    refreshCenter()
+  }
+
+  function closeCenter() {
+    centerOpen = false
+  }
+
+  function toggleCenter() {
+    if (centerOpen) closeCenter()
+    else openCenter()
+  }
+
+  function refreshCenter() {
+    if (readHistoryProc.running || historyReadQueued) {
+      centerRefreshPending = true
+      return
+    }
+    historyReadQueued = true
+    enqueueHistoryRead()
+  }
+
+  property bool centerRefreshPending: false
+
+  function buildCenter(raw) {
+    var live = liveRowsForReplay()
+    var liveStems = {}
+    for (var l = 0; l < live.length; l++) liveStems[NotificationLogic.imageStem(live[l])] = true
+    var rows = NotificationLogic.historyRows(raw, live, NotificationUrgency.Normal, cfg.keepHistory + live.length)
+    var t = Date.now()
+    var desired = []
+    var want = {}
+    for (var i = 0; i < rows.length; i++) {
+      var row = rowOf(rows[i], t, false)
+      row.live = !!liveStems[row.stem]
+      desired.push(row)
+      want[row.stem] = true
+    }
+
+    for (var r = centerModel.count - 1; r >= 0; r--) {
+      var cur = centerModel.get(r)
+      if (!cur || cur.leaving || !want[cur.stem]) centerModel.remove(r)
+    }
+    for (var j = 0; j < desired.length; j++) {
+      var at = indexByStem(centerModel, desired[j].stem)
+      if (at === j) {
+        if (centerModel.get(j).live !== desired[j].live) centerModel.setProperty(j, "live", desired[j].live)
+        continue
+      }
+      if (at > j) centerModel.move(at, j, 1)
+      else centerModel.insert(j, desired[j])
+    }
+    refreshKnownApps()
+
+    if (centerRefreshPending) {
+      centerRefreshPending = false
+      Qt.callLater(refreshCenter)
+    }
+  }
+
+  function refreshKnownApps() {
+    var seen = {}
+    var apps = []
+    function add(key, label) {
+      if (!key || seen[key]) return
+      seen[key] = true
+      apps.push({ key: key, label: label || key })
+    }
+    for (var i = 0; i < cfg.rules.length; i++) add(cfg.rules[i].app, cfg.rules[i].label)
+    var models = [popupModel, centerModel]
+    for (var m = 0; m < models.length; m++)
+      for (var k = 0; k < models[m].count; k++) {
+        var row = models[m].get(k)
+        if (row) add(row.appKey, row.appLabel)
+      }
+    knownApps = apps
+  }
+
+  function deleteHistoryStem(stem) {
+    enqueuePopupFileJob(["bash", "-c", "rm -f \"$1/$2.json\" \"$3/$2\"-*", "--", historyDir, stem, imagesDir])
+  }
+
+  function centerActivate(index) {
+    var row = centerModel.get(index)
+    if (!row || row.leaving) return
+    var stem = row.stem
+    if (row.live) {
+      var p = indexByStem(popupModel, stem)
+      if (p >= 0) invokePopupDefault(p)
+    } else {
+      var argv = NotificationLogic.parseExecArgv(row.execArgv)
+      if (argv) Util.execArgv(argv)
+      else focusApp(row)
+    }
+    deleteHistoryStem(stem)
+    beginLeave(centerModel, index)
+    closeCenter()
+  }
+
+  function centerDismiss(index) {
+    var row = centerModel.get(index)
+    if (!row || row.leaving) return
+    if (row.live) {
+      var p = indexByStem(popupModel, row.stem)
+      if (p >= 0) removePopup(p, "dismiss", false)
+    } else {
+      deleteHistoryStem(row.stem)
+    }
+    beginLeave(centerModel, index)
+  }
+
+  function centerClearGroup(key) {
+    for (var i = centerModel.count - 1; i >= 0; i--) {
+      var row = centerModel.get(i)
+      if (row && !row.leaving && row.appKey === key) centerDismiss(i)
+    }
+    centerToggleGroup(key)
+  }
+
+  function centerClearAll() {
+    clearPopups(false)
+    clearHistory()
+    for (var i = centerModel.count - 1; i >= 0; i--) beginLeave(centerModel, i)
+    centerExpanded = ({})
+  }
+
+  function centerToggleGroup(key) {
+    var next = {}
+    for (var k in centerExpanded) next[k] = centerExpanded[k]
+    if (next[key]) delete next[key]
+    else next[key] = true
+    centerExpanded = next
+  }
+
   Process {
     id: ensureDirsProc
-    command: ["mkdir", "-p", service.stateDir, service.popupStateDir, service.historyDir, service.imagesDir]
+    command: ["mkdir", "-p", service.stateDir, service.popupStateDir, service.historyDir, service.imagesDir, service.faviconDir]
     running: false
   }
 
-  // ---------------------------------------------------- popup persistence
-  //
-  // Mirror every on-screen popup to its own file under popupStateDir so
-  // toasts survive shell restarts (notably the restart `omarchy-update`
-  // performs). Writes, moves and deletes go through one serialized queue: a
-  // burst of replaces_id updates must not race a single reused Process, and
-  // ordering guarantees a delete issued after a write wins.
 
-  // Popups restored from a previous shell process, keyed by their file
-  // name (timestamp-originalId) since ids alone repeat across server
-  // generations. The replaces_id handling and liveRefs lookups must not
-  // match these rows against fresh notifications.
   property var restoredPopups: ({})
-
-  // Entries are either { command, done } for a file job or { read: true } for
-  // a replay's directory read. Queueing the read rather than running it beside
-  // the queue is what makes it a barrier: it takes its place in line, so the
-  // history it sees is the one that existed when the replay was asked for.
-  // Everything queued after it — a clear, an archive, a silenced write — waits
-  // for it, and no amount of later traffic can push it back.
   property var popupFileQueue: []
-
-  // Done callback of the job popupFileProc is currently running.
   property var runningPopupFileJobDone: null
 
   function enqueuePopupFileJob(command, done) {
@@ -484,10 +983,6 @@ Item {
     }
   }
 
-  // Consumes the remaining args as from/to pairs. Bounded read into a temp
-  // file, validated, then renamed into place: the source path is
-  // sender-controlled and may grow, block, or become a FIFO mid-copy, and
-  // must neither hang the serialized queue nor fill the state dir.
   readonly property string copyImagesScript:
     "while (( $# >= 2 )); do\n" +
     "  if [[ -f $1 ]] && timeout 5 head -c 5242881 -- \"$1\" > \"$2.tmp\" 2>/dev/null &&\n" +
@@ -496,10 +991,6 @@ Item {
     "done\n"
 
   function persistPopupFile(snapshot) {
-    // The JSON travels as an argument, not through shell interpolation, so
-    // summaries/bodies with quotes or backticks can't break the command. The
-    // mkdir guards notifications that arrive before ensureDirsProc has run.
-    // Copies run before the JSON referencing them, while the source exists.
     var persistable = NotificationLogic.persistablePopup(snapshot, imagesDir)
     var command = ["bash", "-c",
       "mkdir -p \"$1\" \"$2\" || exit 0\n" +
@@ -518,28 +1009,16 @@ Item {
 
   function deletePopupFileFor(row) {
     if (!row) return
-    // History replays and the "no recent notifications" placeholder never
-    // had a file — rm -f on the computed paths is a harmless no-op there.
     enqueuePopupFileJob(["bash", "-c",
       "rm -f \"$1/$2.json\" \"$3/$2\"-*", "--",
       popupStateDir, NotificationLogic.imageStem(row), imagesDir])
   }
 
-  // ---------------------------------------------------- history
-  //
-  // A popup that leaves the screen keeps its file — it just moves one level
-  // down, into historyDir. Trimming happens right there in the same shell
-  // job: the names sort numerically by their leading millisecond timestamp,
-  // so everything but the newest historyLimit files is the tail to drop,
-  // image copies included. Callers set $hist, $limit and $imgs first.
   readonly property string trimHistoryScript:
     "ls -1 \"$hist\" 2>/dev/null | sort -n | head -n \"-$limit\" | while IFS= read -r stale; do rm -f \"$hist/$stale\" \"$imgs/${stale%.json}\"-*; done"
 
   function archivePopupFileFor(row) {
     if (!row) return
-    // A history replay or the empty-history placeholder has no file to move;
-    // the failed mv leaves the history untouched, trimming included. Image
-    // copies stay put — live and archived entries share imagesDir.
     enqueuePopupFileJob(["bash", "-c",
       "mkdir -p \"$1\" || exit 0\n" +
       "hist=\"$1\" limit=\"$2\" imgs=\"$5\"\n" +
@@ -552,16 +1031,6 @@ Item {
       imagesDir])
   }
 
-  // Record a notification that never made it to the screen (DND silenced it),
-  // straight into history. Same file format as an archived popup, so the
-  // replay can't tell the two apart.
-  //
-  // A silenced notification is untracked the moment it arrives, so the server
-  // has nothing left for a later replaces_id to replace and hands the sender a
-  // fresh id instead. Every update from a chatty thread is therefore its own
-  // notification here, and several can sit in the ten slots together — there
-  // is no id to recognize them by, and guessing from app and summary would
-  // merge genuinely separate messages.
   function writeHistoryFile(entry, done) {
     if (!entry) {
       if (done) done()
@@ -586,6 +1055,8 @@ Item {
   }
 
   function clearHistory() {
+    unread = 0
+    unreadCritical = false
     enqueuePopupFileJob(["bash", "-c",
       "for f in \"$1\"/*.json; do\n" +
       "  [[ -e $f ]] || continue\n" +
@@ -594,9 +1065,6 @@ Item {
       "done", "--", historyDir, imagesDir])
   }
 
-  // A restart can kill a queued job between its cp and its JSON write,
-  // leaving copies no JSON-derived cleanup can name. Swept at startup,
-  // through the queue so in-flight copies aren't mistaken for orphans.
   function sweepOrphanImages() {
     enqueuePopupFileJob(["bash", "-c",
       "for img in \"$3\"/*; do\n" +
@@ -611,34 +1079,14 @@ Item {
   Process {
     id: readHistoryProc
     running: false
-    // Let the file queue go again, whatever the read did — a failed or empty
-    // read must not leave archives and clears parked behind it forever.
     onExited: service.runNextPopupFileJob()
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: service.replayHistory(text)
+      onStreamFinished: service.buildCenter(text)
     }
   }
 
-  // Toasts that were on screen when the replay was asked for. The clear in
-  // replayHistory archives them, but the directory read is already in flight
-  // by then, so they're handed over in memory instead of being waited for.
-  property var replayCarryOver: []
-
-  // Set from the moment a read is queued until it starts, so a second
-  // showHistory while one is still waiting its turn doesn't queue another.
   property bool historyReadQueued: false
-
-  // Re-show what's in historyDir as toasts. The read goes through the file
-  // queue and its own subprocess, so the replay lands in replayHistory once
-  // the work queued ahead of it has finished.
-  function showRecentHistory() {
-    if (readHistoryProc.running || service.historyReadQueued) return "ok"
-    service.replayCarryOver = liveRowsForReplay()
-    service.historyReadQueued = true
-    enqueueHistoryRead()
-    return "ok"
-  }
 
   function startHistoryRead() {
     service.historyReadQueued = false
@@ -647,16 +1095,11 @@ Item {
     readHistoryProc.running = true
   }
 
-  // Copy the on-screen rows out of the model. The placeholder from an earlier
-  // empty replay carries originalId -1 and is not a notification, so it is
-  // left behind rather than replayed as one. The replay dismisses these
-  // notifications, and senders delete their images on close — so the carried
-  // rows point at the persisted copies, like the archived files they join.
   function liveRowsForReplay() {
     var rows = []
     for (var i = 0; i < popupModel.count; i++) {
       var row = popupModel.get(i)
-      if (!row || row.originalId < 0) continue
+      if (!row || row.originalId < 0 || row.leaving) continue
       rows.push(NotificationLogic.persistablePopup({
         id: row.id,
         originalId: row.originalId,
@@ -674,41 +1117,6 @@ Item {
     return rows
   }
 
-  function replayHistory(raw) {
-    var rows = NotificationLogic.historyRows(
-      raw, service.replayCarryOver, NotificationUrgency.Normal, service.historyLimit)
-    service.replayCarryOver = []
-
-    // Replaying nothing at all looks like a dead keybinding, so say so.
-    if (rows.length === 0) {
-      popupModel.insert(0, {
-        id: -1,
-        originalId: -1,
-        app: "omarchy-action",
-        appIcon: "",
-        summary: "No recent notifications",
-        body: "",
-        image: "",
-        glyph: "󰂚",
-        execArgv: "",
-        urgency: NotificationUrgency.Low,
-        expireTimeout: 0,
-        timestamp: Date.now()
-      })
-      return
-    }
-
-    clearPopups()
-    // Rows arrive newest-first, and index 0 is the top of the toast stack.
-    for (var i = 0; i < rows.length; i++) {
-      // Replayed rows are restored rows: their notification died with the
-      // sender long ago, so they must never resolve to a live server object
-      // that has since been handed their old id.
-      service.restoredPopups[NotificationLogic.popupFileName(rows[i])] = true
-      popupModel.append(rows[i])
-    }
-  }
-
   Process {
     id: restorePopupsProc
     running: false
@@ -720,27 +1128,18 @@ Item {
 
   function restorePopups(raw) {
     var entries = NotificationLogic.parsePopupFiles(raw, NotificationUrgency.Normal)
-    var now = Date.now()
+    var t = Date.now()
     var live = []
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i]
       var duration = durationFor(entry.urgency, entry.expireTimeout)
-      if (NotificationLogic.popupExpired(entry, duration, now)) {
-        // It would have expired on screen had the shell kept running, so it
-        // gets archived exactly like an expiry that happened while it did.
+      if (NotificationLogic.popupExpired(entry, duration, t)) {
         archivePopupFileFor(entry)
         continue
       }
-      // Survivors restart with a full lifetime on purpose: shell restarts
-      // are rare, and a full look after the restart flicker beats resuming
-      // a toast with a second left on its clock. The reset is persisted as
-      // an absolute deadline so a second restart while the toast is still
-      // on screen judges it by the reset clock, not the original timestamp.
       if (duration > 0) {
-        entry.deadline = now + duration
+        entry.deadline = t + duration
         persistPopupFile(entry)
-        // deadline is persistence metadata, not a model role — fresh rows
-        // never carry it, and ListModel roles must stay consistent.
         delete entry.deadline
       }
       live.push(entry)
@@ -750,13 +1149,6 @@ Item {
     Qt.callLater(function() {
       for (var j = 0; j < live.length; j++) {
         var restored = live[j]
-        // A notification received while the restore was reading the dir can
-        // already occupy this originalId with the same timestamp — then it
-        // IS this entry, live with its own file, and must be left alone. A
-        // different timestamp is indistinguishable between a genuine
-        // cross-restart replaces_id and a new-generation id coincidence, so
-        // show both: a briefly duplicated toast beats silently dropping a
-        // restored critical alert.
         var duplicate = false
         for (var k = 0; k < popupModel.count; k++) {
           var row = popupModel.get(k)
@@ -766,17 +1158,25 @@ Item {
           }
         }
         if (duplicate) continue
-        // Append (entries are newest-first) so restored toasts stack in
-        // their original order below anything that just arrived. Restored
-        // popups have no liveRefs entry — the server object died with the
-        // old shell — so dismissal and action fallbacks degrade gracefully.
         service.restoredPopups[NotificationLogic.popupFileName(restored)] = true
-        popupModel.append(restored)
+        popupModel.append(service.rowOf(restored, Date.now(), true))
       }
     })
   }
 
-  // ---------------------------------------------------- settings persistence
+  // counts what arrived while the shell was down or the center was closed
+  Process {
+    id: unreadProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var stamps = String(text || "").split("\n").map(function(n) { return Number(String(n).split("-")[0]) })
+        service.unread += Model.unreadCount(stamps, service.lastSeen)
+      }
+    }
+  }
+
 
   FileView {
     id: settingsFile
@@ -785,10 +1185,6 @@ Item {
     atomicWrites: true
     printErrors: false
     onLoaded: service.loadSettings(text())
-    // First-run: the file doesn't exist yet. Without this branch,
-    // `settingsLoaded` stays false forever and `scheduleSettingsSave` becomes
-    // a no-op — so the file is never created and the DND preference vanishes
-    // on shell restart.
     onLoadFailed: service.loadSettings("")
   }
 
@@ -805,11 +1201,9 @@ Item {
   }
 
   property bool settingsLoaded: false
+  property string upstreamAck: ""
 
   function loadSettings(raw) {
-    // FileView can fire onLoaded more than once during startup — the implicit
-    // preload when `path` resolves, plus the explicit `settingsFile.reload()`
-    // in Component.onCompleted can both end up calling here.
     if (service.settingsLoaded) return
 
     var parsed = NotificationLogic.parseSettings(raw)
@@ -821,38 +1215,78 @@ Item {
       service._hydrating = false
     }
 
+    try {
+      var extra = JSON.parse(String(raw || "").trim() || "{}")
+      service.lastSeen = Number(extra.lastSeen || 0)
+      service.upstreamAck = String(extra.upstreamAck || "")
+    } catch (e) {
+    }
+
     service.settingsLoaded = true
-    // Versions before the history moved into its own directory kept every
-    // notification in here. Rewrite once so that dead payload doesn't sit in
-    // the file until the next DND toggle happens to clear it.
     if (parsed.legacy) service.scheduleSettingsSave()
+
+    upstreamProc.running = true
+    if (service.lastSeen <= 0) {
+      service.lastSeen = Date.now()
+      service.scheduleSettingsSave()
+      return
+    }
+    unreadProc.command = ["bash", "-c", "ls -1 \"$1\" 2>/dev/null; ls -1 \"$2\" 2>/dev/null | grep '\\.json$'", "--", historyDir, popupStateDir]
+    unreadProc.running = true
   }
 
   function flushSettings() {
-    settingsFile.setText(JSON.stringify({ version: 3, dnd: persisted.doNotDisturb }, null, 2) + "\n")
+    settingsFile.setText(JSON.stringify({
+      version: 3,
+      dnd: persisted.doNotDisturb,
+      lastSeen: service.lastSeen,
+      upstreamAck: service.upstreamAck
+    }, null, 2) + "\n")
+  }
+
+
+  Process {
+    id: upstreamProc
+    running: false
+    command: ["bash", "-c",
+      "cd \"$1\" 2>/dev/null || exit 0\n" +
+      "sha256sum -c --quiet \"$2\" >/dev/null 2>&1 && { echo same; exit 0; }\n" +
+      "cat Service.qml NotificationLogic.js components/NotificationCard.qml manifest.json 2>/dev/null | sha256sum | cut -c1-16",
+      "--", service.stockDir, service.pluginDir + "/upstream.sha256"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: service.upstreamChecked(String(text || "").trim())
+    }
+  }
+
+  function upstreamChecked(result) {
+    if (!result || result === "same" || result === upstreamAck) return
+    upstreamAck = result
+    scheduleSettingsSave()
+    var entry = {
+      id: -2, originalId: -2, app: "eduardo.notifications", appIcon: "",
+      summary: "omarchy.notifications changed in this update",
+      body: "eduardo.notifications is based on omarchy 4.0.4. Click to see what changed upstream.",
+      image: "", glyph: "", urgency: NotificationUrgency.Normal, expireTimeout: 0, timestamp: Date.now(),
+      execArgv: JSON.stringify(["omarchy-launch-floating-terminal-with-presentation", pluginDir + "/bin/eduardo-notifications-upstream-diff"])
+    }
+    restoredPopups[NotificationLogic.popupFileName(entry)] = true
+    persistPopupFile(entry)
+    popupModel.insert(0, rowOf(entry, Date.now(), true))
   }
 
   Component.onCompleted: {
     ensureDirsProc.running = true
-    // Once mkdir has had a tick, load the existing settings file. FileView
-    // surfaces an empty string when the file doesn't exist; loadSettings
-    // handles that path.
+    webappsProc.running = true
     Qt.callLater(function() {
       settingsFile.reload()
-      // Re-show popups that were on screen when the previous shell died.
-      // The glob-through-bash tolerates a missing/empty dir (first run).
-      // awk 1 (not cat) so a torn file missing its trailing newline can't
-      // glue itself onto the next file and take a valid popup down with it.
       restorePopupsProc.command = ["bash", "-c",
         "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", service.popupStateDir]
       restorePopupsProc.running = true
-      // Safe beside the restore read: it only re-persists entries whose
-      // JSON exists, exactly the images the sweep keeps.
       service.sweepOrphanImages()
     })
   }
 
-  // ---------------------------------------------------- IPC
 
   IpcHandler {
     target: "notifications"
@@ -877,45 +1311,43 @@ Item {
       return dndState()
     }
 
-    // Replay the notifications that have been moved into the history dir.
+    // stock replayed history as toasts, the center is the history now
     function showHistory(): string {
-      return service.showRecentHistory()
+      service.openCenter()
+      return "ok"
     }
 
-    // `clear` forgets the recorded history; the toasts on screen stay put.
     function clear(): string {
       service.clearHistory()
       return "ok"
     }
 
     function dismissAll(): string {
-      service.clearPopups()
+      service.clearPopups(true)
       return "ok"
     }
 
-    // Dismiss the most recent popup.
     function dismissOne(): string {
-      if (popupModel.count === 0) return "none"
-      service.dismissPopup(0)
+      var i = service.firstActiveIndex()
+      if (i < 0) return "none"
+      service.dismissPopup(i)
       return "ok"
     }
 
-    // Fire the default action on the most recent popup, then dismiss it.
     function invokeLast(): string {
-      if (popupModel.count === 0) return "none"
-      service.invokePopupDefault(0)
+      var i = service.firstActiveIndex()
+      if (i < 0) return "none"
+      service.invokePopupDefault(i)
       return "ok"
     }
 
-    // Take a toast off the screen by summary substring, used by the
-    // first-run notifications once their action has been clicked.
     function dismiss(summary: string): string {
       var needle = String(summary || "")
       if (!needle) return "none"
       var hit = false
       for (var i = popupModel.count - 1; i >= 0; i--) {
         var row = popupModel.get(i)
-        if (row && String(row.summary || "").indexOf(needle) !== -1) {
+        if (row && !row.leaving && String(row.summary || "").indexOf(needle) !== -1) {
           service.dismissPopup(i)
           hit = true
         }
@@ -923,10 +1355,28 @@ Item {
       return hit ? "ok" : "none"
     }
 
+    function toggleCenter(): string {
+      service.toggleCenter()
+      return service.centerOpen ? "open" : "closed"
+    }
+
+    function openCenter(): string {
+      service.openCenter()
+      return "open"
+    }
+
+    function closeCenter(): string {
+      service.closeCenter()
+      return "closed"
+    }
+
+    function unreadCount(): string {
+      return String(service.unread)
+    }
+
     function ping(): string { return "ok" }
   }
 
-  // ---------------------------------------------------- server
 
   NotificationServer {
     id: server
@@ -942,12 +1392,13 @@ Item {
     }
   }
 
-  // -------------------------------------------------------------- popup UI
-  //
-  // One PanelWindow per output (Variants on Quickshell.screens) holding the
-  // stacked toast cards. Layer is Overlay, exclusionMode Ignore, no
-  // keyboard focus — popups are passive surfaces and must never steal input
-  // from the focused application.
+
+  readonly property string focusedScreenName: Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+
+  function isToastScreen(screen) {
+    if (cfg.monitor === "primary") return Quickshell.screens.length > 0 && screen === Quickshell.screens[0]
+    return !focusedScreenName || screen.name === focusedScreenName
+  }
 
   Variants {
     model: Quickshell.screens
@@ -956,104 +1407,102 @@ Item {
       id: popupWindow
       required property var modelData
       screen: modelData
-      visible: popupModel.count > 0
+      visible: popupModel.count > 0 && !service.centerVisible && service.isToastScreen(modelData)
 
-      WlrLayershell.namespace: "omarchy-notifications"
+      WlrLayershell.namespace: "eduardo-notifications"
       WlrLayershell.layer: WlrLayer.Overlay
       WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
       exclusionMode: ExclusionMode.Ignore
       color: "transparent"
 
-      readonly property var popupPlacement: NotificationLogic.popupPlacement(
-        service.barPosition, service.barClearance, Style.gapsOut)
+      anchors { top: true; bottom: true; left: true; right: true }
+      mask: Region { item: toastStack }
 
-      // Full-screen, fixed-size surface (like the OSD overlay). Adding or
-      // removing a toast changes only the content inside; the Wayland surface
-      // never resizes, so the compositor can't briefly scale a stale buffer --
-      // which is what stretched/squished the cards during count changes.
+      readonly property string pos: service.cfg.position
+      readonly property bool atBottom: pos.indexOf("bottom") === 0
+      readonly property int marginTop: service.barPosition === "top" ? service.barClearance : Style.gapsOut
+      readonly property int marginBottom: service.barPosition === "bottom" ? service.barClearance : Style.gapsOut
+      readonly property int marginLeft: service.barPosition === "left" ? service.barClearance : Style.gapsOut
+      readonly property int marginRight: service.barPosition === "right" ? service.barClearance : Style.gapsOut
+
+      CardStack {
+        id: toastStack
+        theme: glassTheme
+        model: popupModel
+        mode: "toast"
+        groupByApp: service.cfg.groupByApp
+        maxGroups: service.cfg.maxOnScreen
+        flip: popupWindow.atBottom
+        expanded: service.toastExpanded
+        now: service.now
+        extraMs: service.extraMs
+        timerMode: service.cfg.timer
+        footer: service.cfg.style === "footer"
+        footerActions: service.cfg.footerActions
+        x: popupWindow.pos.indexOf("left") > 0 ? popupWindow.marginLeft
+          : popupWindow.pos.indexOf("center") > 0 ? Math.round((parent.width - width) / 2)
+          : parent.width - width - popupWindow.marginRight
+        y: popupWindow.atBottom ? parent.height - height - popupWindow.marginBottom : popupWindow.marginTop
+
+        Behavior on y {
+          enabled: popupWindow.atBottom
+          NumberAnimation { duration: glassTheme.motion; easing.type: Easing.OutQuint }
+        }
+
+        onHoveredChanged: service.toastHovered = hovered
+        onCardActivated: function(i) { service.invokePopupDefault(i) }
+        onCardDismissed: function(i) { service.dismissPopup(i) }
+        onCardSnoozed: function(i) { service.snoozePopup(i) }
+        onCardApp: function(i) {
+          var row = popupModel.get(i)
+          service.focusApp(row)
+          service.dismissPopup(i)
+        }
+        onGroupToggled: function(key) { service.toggleToastGroup(key) }
+        onGroupCleared: function(key) {
+          for (var i = popupModel.count - 1; i >= 0; i--) {
+            var row = popupModel.get(i)
+            if (row && !row.leaving && row.appKey === key) service.dismissPopup(i)
+          }
+          service.toggleToastGroup(key)
+        }
+        onOverflowClicked: service.openCenter()
+      }
+    }
+  }
+
+
+  Variants {
+    model: Quickshell.screens
+
+    PanelWindow {
+      id: centerWindow
+      required property var modelData
+      screen: modelData
+      visible: service.centerVisible && (!service.centerScreenName || modelData.name === service.centerScreenName)
+
+      WlrLayershell.namespace: "eduardo-notifications-center"
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: service.centerOpen ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+      exclusionMode: ExclusionMode.Ignore
+      color: "transparent"
+
       anchors { top: true; bottom: true; left: true; right: true }
 
-      // Keep the surface click-through except over the toast column, so the
-      // rest of the (invisible) full-screen overlay never eats input.
-      mask: Region { item: popupColumn }
+      CenterView {
+        id: centerView
+        host: service
+        theme: glassTheme
+        progress: service.centerProgress
+        topMargin: service.barPosition === "top" ? service.barClearance : Style.gapsOut
+        rightMargin: service.barPosition === "right" ? service.barClearance : Style.gapsOut
 
-      ColumnLayout {
-        id: popupColumn
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.topMargin: popupWindow.popupPlacement.margins.top
-        anchors.rightMargin: popupWindow.popupPlacement.margins.right
-        spacing: Style.space(8)
-
-        Repeater {
-          model: popupModel
-
-          // The delegate is a slot Item that owns lifetime timer state. The
-          // actual visuals live in NotificationCard, which the history panel
-          // also reuses.
-          delegate: Item {
-            id: cardSlot
-            required property int index
-            required property string app
-            required property string appIcon
-            required property string summary
-            required property string body
-            required property string image
-            required property string glyph
-            required property int urgency
-            required property double expireTimeout
-            required property double timestamp
-
-            // Each card sizes itself based on mode (text vs media); the slot
-            // tracks the card so the column auto-fits to whichever is widest.
-            Layout.preferredWidth: card.implicitWidth
-            Layout.alignment: Qt.AlignRight
-            implicitHeight: card.implicitHeight
-
-            readonly property real lifetime: service.durationFor(cardSlot.urgency, cardSlot.expireTimeout)
-            property real remainingLifetime: 1.0
-            readonly property bool ticking: cardSlot.lifetime > 0 && !card.hovered
-
-            // A client updating this notification in place rewrites the row
-            // under the card (see refreshPopup). New text deserves a full look,
-            // so the countdown starts over instead of running out the clock the
-            // superseded text was already most of the way through. Delegates
-            // keep their own row as the model changes around them, so only a
-            // real content change lands here.
-            onSummaryChanged: cardSlot.remainingLifetime = 1.0
-            onBodyChanged: cardSlot.remainingLifetime = 1.0
-            onImageChanged: cardSlot.remainingLifetime = 1.0
-
-            Timer {
-              interval: 50
-              repeat: true
-              running: cardSlot.ticking
-              onTriggered: {
-                if (cardSlot.lifetime <= 0) return
-                cardSlot.remainingLifetime -= 50.0 / cardSlot.lifetime
-                if (cardSlot.remainingLifetime <= 0) {
-                  cardSlot.remainingLifetime = 0
-                  service.expirePopup(cardSlot.index)
-                }
-              }
-            }
-
-            NotificationCard {
-              id: card
-              anchors.right: parent.right
-              app: cardSlot.app
-              appIcon: cardSlot.appIcon
-              summary: cardSlot.summary
-              body: cardSlot.body
-              image: cardSlot.image
-              urgency: cardSlot.urgency
-              timestamp: cardSlot.timestamp
-              cornerRadius: service.cornerRadius
-              fontFamily: service.shell && service.shell.bar ? service.shell.bar.fontFamily : ""
-              glyph: cardSlot.glyph
-
-              onCloseRequested: service.dismissPopup(cardSlot.index)
-              onCardClicked: service.invokePopupDefault(cardSlot.index)
+        Connections {
+          target: service
+          function onCenterOpenChanged() {
+            if (service.centerOpen) {
+              centerView.view = "list"
+              centerView.forceActiveFocus()
             }
           }
         }

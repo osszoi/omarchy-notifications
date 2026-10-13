@@ -1,0 +1,15 @@
+#!/bin/bash
+# what changed in the stock omarchy.notifications since this plugin was cut from it
+
+set -u
+REPO=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+STOCK=/usr/share/omarchy/shell/plugins/notifications
+BASE=$(git -C "$REPO" rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+
+{
+  echo "stock omarchy.notifications vs the 4.0.4 copy this plugin is based on ($BASE)"
+  echo
+  for f in Service.qml NotificationLogic.js components/NotificationCard.qml manifest.json; do
+    diff -u --label "4.0.4/$f" --label "now/$f" <(git -C "$REPO" show "$BASE:$f" 2>/dev/null) "$STOCK/$f"
+  done
+} | less -R

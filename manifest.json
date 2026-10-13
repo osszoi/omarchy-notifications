@@ -1,15 +1,29 @@
 {
   "schemaVersion": 1,
-  "id": "omarchy.notifications",
+  "id": "eduardo.notifications",
   "name": "Notifications",
   "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "Notification daemon, popups, DND, and history",
+  "author": "eduardo (based on omarchy.notifications)",
+  "license": "MIT",
+  "description": "Notification daemon with glass toasts, a floating notification center behind a bar bell, settings, per-app rules, snooze and do-not-disturb schedules. Drop-in for omarchy.notifications: same history, DND and IPC.",
   "kinds": [
-    "service"
+    "service",
+    "bar-widget"
   ],
   "keepLoaded": true,
   "entryPoints": {
-    "service": "Service.qml"
-  }
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Notifications",
+    "description": "Bell with unread count; opens the notification center",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.notifications"
+  },
+  "homepage": "https://github.com/osszoi/omarchy-notifications"
 }

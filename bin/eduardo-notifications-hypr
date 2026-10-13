@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# Writes ~/.local/state/omarchy/toggles/hypr/eduardo-notifications.lua (center
+# keybind + layer rules), reloads hyprland and puts the old file back if the
+# reload reports errors. bindings.lua is never touched: the toggles dir loads
+# after it, so hl.unbind there wins.
+#
+#   eduardo-notifications-hypr check "SUPER + N"
+#   eduardo-notifications-hypr apply --shortcut "SUPER + N" --blur 1 [--force]
+#   eduardo-notifications-hypr remove
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+TOGGLES = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                       "omarchy", "toggles", "hypr")
+FILE = os.path.join(TOGGLES, "eduardo-notifications.lua")
+COMMAND = "omarchy-shell notifications toggleCenter"
+MODS = {"SUPER": 64, "SHIFT": 1, "CTRL": 4, "CONTROL": 4, "ALT": 8}
+KEY_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def out(obj):
+    print(json.dumps(obj))
+    sys.exit(0)
+
+
+def parse(chord):
+    parts = [p.strip() for p in chord.split("+") if p.strip()]
+    if len(parts) < 2:
+        return None
+    mask = 0
+    for p in parts[:-1]:
+        if p.upper() not in MODS:
+            return None
+        mask |= MODS[p.upper()]
+    key = parts[-1]
+    if not KEY_RE.match(key):
+        return None
+    return mask, key, " + ".join([p.upper() for p in parts[:-1]] + [key])
+
+
+def hyprctl(*args):
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def conflicts(mask, key):
+    try:
+        binds = json.loads(hyprctl("binds", "-j") or "[]")
+    except ValueError:
+        return []
+    hits = []
+    for b in binds:
+        if b.get("modmask") != mask or str(b.get("key", "")).lower() != key.lower():
+            continue
+        if COMMAND in str(b.get("arg", "")):
+            continue
+        hits.append(b.get("description") or (str(b.get("dispatcher", "")) + " " + str(b.get("arg", ""))).strip())
+    return hits
+
+
+def errors():
+    text = hyprctl("configerrors").strip()
+    return "" if not text or text.lower().startswith("no errors") else text
+
+
+def render(chord, blur):
+    lines = [
+        "-- written by eduardo.notifications (notification center settings), delete it and reload hyprland to undo",
+        'hl.unbind("%s")' % chord,
+        'o.bind("%s", "Notification center", "%s")' % (chord, COMMAND),
+        'hl.layer_rule({ match = { namespace = "^eduardo-notifications" }, no_anim = true, animation = "none" })',
+    ]
+    if blur:
+        lines += [
+            "hl.config({ decoration = { blur = { enabled = true } } })",
+            'hl.window_rule({ match = { class = ".*" }, no_blur = true })',
+            'hl.layer_rule({ match = { namespace = "^eduardo-notifications" }, blur = true, ignore_alpha = 0.3 })',
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def write(content):
+    os.makedirs(TOGGLES, exist_ok=True)
+    tmp = FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.replace(tmp, FILE)
+
+
+def apply(chord_text, blur, force):
+    parsed = parse(chord_text)
+    if not parsed:
+        out({"ok": False, "error": "can't read shortcut " + chord_text})
+    mask, key, chord = parsed
+    hits = conflicts(mask, key)
+    if hits and not force:
+        out({"ok": False, "conflict": hits[0]})
+
+    before = errors()
+    previous = None
+    if os.path.exists(FILE):
+        with open(FILE) as f:
+            previous = f.read()
+
+    write(render(chord, blur))
+    hyprctl("reload")
+    after = errors()
+    if after and after != before:
+        if previous is None:
+            os.remove(FILE)
+        else:
+            write(previous)
+        hyprctl("reload")
+        out({"ok": False, "error": after.splitlines()[0][:200]})
+    out({"ok": True, "shortcut": chord})
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "check":
+        parsed = parse(argv[1])
+        if not parsed:
+            out({"ok": False, "error": "can't read shortcut " + argv[1]})
+        hits = conflicts(parsed[0], parsed[1])
+        out({"ok": not hits, "conflict": hits[0] if hits else ""})
+    if argv and argv[0] == "apply":
+        chord, blur, force = "SUPER + N", True, False
+        i = 1
+        while i < len(argv):
+            if argv[i] == "--shortcut" and i + 1 < len(argv):
+                chord = argv[i + 1]
+                i += 2
+            elif argv[i] == "--blur" and i + 1 < len(argv):
+                blur = argv[i + 1] in ("1", "true", "on")
+                i += 2
+            elif argv[i] == "--force":
+                force = True
+                i += 1
+            else:
+                i += 1
+        apply(chord, blur, force)
+    if argv and argv[0] == "remove":
+        if os.path.exists(FILE):
+            os.remove(FILE)
+            hyprctl("reload")
+        out({"ok": True})
+    out({"ok": False, "error": "usage: check CHORD | apply --shortcut CHORD --blur 0|1 [--force] | remove"})
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
