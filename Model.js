@@ -7,6 +7,7 @@ var RULE_MODES = ["normal", "center", "mute"]
 var DEFAULTS = {
   version: 1,
   style: "glass",
+  footer: false,
   footerActions: ["app", "open", "snooze"],
   timer: "bar",
   hideAfter: 8,
@@ -76,7 +77,8 @@ function normalizeSettings(raw) {
   }
   return {
     version: 1,
-    style: pick(s.style, ["glass", "footer"], d.style),
+    style: pick(s.style, ["glass", "omarchy"], d.style),
+    footer: typeof s.footer === "boolean" ? s.footer : s.style === "footer",
     footerActions: footer,
     timer: pick(s.timer, ["bar", "ring", "none"], d.timer),
     hideAfter: clampInt(s.hideAfter, 2, 60, d.hideAfter),

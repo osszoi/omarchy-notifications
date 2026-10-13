@@ -45,6 +45,7 @@ Item {
 
   Theme {
     id: glassTheme
+    style: service.cfg.style
     glassOpacity: service.cfg.glassOpacity / 100
   }
 
@@ -1479,7 +1480,7 @@ Item {
         now: service.now
         extraMs: service.extraMs
         timerMode: service.cfg.timer
-        footer: service.cfg.style === "footer"
+        footer: service.cfg.footer
         footerActions: service.cfg.footerActions
         x: popupWindow.pos.indexOf("left") > 0 ? popupWindow.marginLeft
           : popupWindow.pos.indexOf("center") > 0 ? Math.round((parent.width - width) / 2)

@@ -48,7 +48,7 @@ Rectangle {
   readonly property bool wideImage: hasImage && !ring && avatar.ratio > 1.25
   readonly property bool hasIcon: !hasImage && iconImg.status === Image.Ready
   readonly property bool footerOn: footer && footerActions.length > 0
-  readonly property color tone: critical ? theme.urgent : theme.accent
+  readonly property color tone: critical ? theme.urgent : theme.countdown
   readonly property string when: Model.relativeTime(timestamp, now)
   readonly property string meta: [appLabel, when].filter(function(s) { return s.length > 0 }).join(" · ")
     + (repeat > 1 ? "  ×" + repeat : "")
@@ -67,7 +67,7 @@ Rectangle {
   implicitHeight: main.height + (footerOn ? footerBar.height : 0)
   radius: theme.radius
   color: critical ? Qt.tint(theme.glass, theme.urgentFill) : (hovered ? theme.glassHot : theme.glass)
-  border.width: theme.hairline
+  border.width: theme.borderWidth
   border.color: critical ? theme.urgentLine : theme.border
   antialiasing: true
 
@@ -117,15 +117,15 @@ Rectangle {
         height: width
         radius: root.ring ? width / 2 : root.theme.rowRadius
         visible: !root.hasImage && !root.hasIcon
-        color: root.critical ? root.theme.urgentFill : root.theme.accentFill
+        color: root.critical ? root.theme.urgentFill : root.theme.tileFill
 
         Text {
           anchors.centerIn: parent
           text: root.glyph.length > 0 ? root.glyph : (root.critical ? root.theme.glyphWarn : root.theme.glyphBell)
           textFormat: Text.PlainText
           font.family: root.theme.iconFont
-          font.pixelSize: root.theme.px(15)
-          color: root.tone
+          font.pixelSize: root.theme.px(root.theme.omarchy ? 22 : 15)
+          color: root.critical ? root.theme.urgent : root.theme.tileGlyph
         }
       }
 
@@ -152,7 +152,7 @@ Rectangle {
         width: root.ring ? root.theme.px(32) : parent.width
         height: root.ring ? root.theme.px(32) : parent.height
         source: root.image
-        radius: root.wideImage ? root.theme.px(6) : width / 2
+        radius: root.theme.omarchy ? root.theme.radius : (root.wideImage ? root.theme.px(6) : width / 2)
         visible: root.hasImage
       }
     }
@@ -177,9 +177,9 @@ Rectangle {
           anchors.rightMargin: root.theme.px(8)
           text: root.summary.length > 0 ? root.summary : root.appLabel
           textFormat: Text.PlainText
-          font.family: root.theme.font
+          font.family: root.theme.cardFont
           font.pixelSize: root.theme.titleSize
-          font.weight: Font.DemiBold
+          font.weight: root.theme.cardTitleWeight
           color: root.critical ? root.theme.urgent : root.theme.fg
           wrapMode: Text.Wrap
           maximumLineCount: 2
@@ -199,7 +199,7 @@ Rectangle {
             anchors.verticalCenter: parent.verticalCenter
             width: countText.implicitWidth + root.theme.px(12)
             height: root.theme.px(17)
-            radius: height / 2
+            radius: root.theme.round(height)
             color: root.theme.accentFill
 
             Text {
@@ -229,8 +229,8 @@ Rectangle {
         visible: root.hasBody
         text: root.styledBody
         textFormat: Text.StyledText
-        font.family: root.theme.font
-        font.pixelSize: root.theme.bodySize
+        font.family: root.theme.cardFont
+        font.pixelSize: root.theme.cardBodySize
         color: root.theme.dim
         linkColor: root.theme.accent
         wrapMode: Text.Wrap
@@ -248,7 +248,7 @@ Rectangle {
     anchors.margins: root.theme.px(10)
     width: root.theme.px(22)
     height: width
-    radius: root.theme.px(6)
+    radius: root.theme.smallRadius
     color: closeArea.containsMouse ? root.theme.fillHot : root.theme.fill
 
     Text {
@@ -317,11 +317,11 @@ Rectangle {
 
   Rectangle {
     visible: root.showTimer && root.timerMode === "bar"
-    x: root.radius
-    y: root.height - height - root.theme.hairline - 1
+    x: Math.max(root.radius, root.theme.borderWidth)
+    y: root.height - height - root.theme.borderWidth - 1
     height: 2
     radius: 1
-    width: Math.max(0, (root.width - root.radius * 2) * Math.max(0, Math.min(1, root.progress)))
+    width: Math.max(0, (root.width - x * 2) * Math.max(0, Math.min(1, root.progress)))
     color: root.tone
     opacity: 0.8 * root.contentOpacity
   }
@@ -334,7 +334,7 @@ Rectangle {
 
     width: btnText.implicitWidth + root.theme.px(16)
     height: root.theme.px(24)
-    radius: root.theme.px(6)
+    radius: root.theme.smallRadius
     color: btnArea.containsMouse ? root.theme.fillHot : "transparent"
 
     Text {

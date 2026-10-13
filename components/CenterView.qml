@@ -49,9 +49,9 @@ FocusScope {
       anchors.right: parent.right
       width: headerRow.implicitWidth + root.theme.px(root.view === "list" ? 20 : 26)
       height: root.theme.px(36)
-      radius: height / 2
+      radius: root.theme.round(height)
       color: root.theme.glass
-      border.width: root.theme.hairline
+      border.width: root.theme.borderWidth
       border.color: root.theme.border
 
       Behavior on width { NumberAnimation { duration: root.theme.motion; easing.type: Easing.OutQuint } }

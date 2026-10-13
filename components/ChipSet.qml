@@ -29,7 +29,7 @@ Row {
 
       width: chipText.implicitWidth + root.theme.px(16)
       height: root.theme.px(24)
-      radius: height / 2
+      radius: root.theme.round(height)
       color: on ? root.theme.accentFill : (chipArea.containsMouse ? root.theme.fill : "transparent")
       border.width: root.theme.hairline
       border.color: on ? root.theme.accentLine : root.theme.fillHot

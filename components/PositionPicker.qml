@@ -15,7 +15,7 @@ Rectangle {
 
   width: theme.px(78)
   height: theme.px(46)
-  radius: theme.px(5)
+  radius: theme.smallRadius
   color: "transparent"
   border.width: theme.hairline
   border.color: theme.fillHot

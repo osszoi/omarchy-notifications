@@ -43,6 +43,17 @@ test("settings are clamped and filtered", function() {
   assert.strictEqual(s.rules[0].mode, "mute")
 })
 
+test("style is glass or omarchy, old footer style migrates", function() {
+  var old = M.normalizeSettings({ style: "footer" })
+  assert.strictEqual(old.style, "glass")
+  assert.strictEqual(old.footer, true)
+  var om = M.normalizeSettings({ style: "omarchy" })
+  assert.strictEqual(om.style, "omarchy")
+  assert.strictEqual(om.footer, false)
+  assert.strictEqual(M.normalizeSettings({ style: "omarchy", footer: true }).footer, true)
+  assert.strictEqual(M.normalizeSettings({ style: "neon" }).style, "glass")
+})
+
 test("serialize round-trips", function() {
   var s = M.normalizeSettings({ timer: "ring", groupByApp: false })
   assert.deepStrictEqual(M.parseSettingsText(M.serializeSettings(s)), s)

@@ -214,9 +214,9 @@ Item {
       height: stack.theme.pillHeight
       y: stack.flipY(modelData.y, height)
       z: 1000
-      radius: height / 2
+      radius: stack.theme.round(height)
       color: stack.theme.glass
-      border.width: stack.theme.hairline
+      border.width: stack.theme.borderWidth
       border.color: stack.theme.border
       opacity: entered ? 1 : 0
 
@@ -281,9 +281,9 @@ Item {
     z: 1000
     width: overflowText.implicitWidth + stack.theme.px(24)
     height: stack.theme.pillHeight
-    radius: height / 2
+    radius: stack.theme.round(height)
     color: overflowArea.containsMouse ? stack.theme.glassHot : stack.theme.glass
-    border.width: stack.theme.hairline
+    border.width: stack.theme.borderWidth
     border.color: stack.theme.border
 
     Behavior on y { NumberAnimation { duration: stack.theme.motion; easing.type: Easing.OutQuint } }

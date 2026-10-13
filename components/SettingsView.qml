@@ -40,7 +40,7 @@ Column {
       label: "Style"
       Segmented {
         theme: root.theme
-        options: [{ value: "glass", label: "Glass" }, { value: "footer", label: "+ Footer" }]
+        options: [{ value: "glass", label: "Glass" }, { value: "omarchy", label: "Omarchy" }]
         value: root.cfg.style
         onPicked: function(v) { root.update({ style: v }) }
       }
@@ -49,7 +49,17 @@ Column {
     SettingRow {
       theme: root.theme
       label: "Footer"
-      dimmed: root.cfg.style !== "footer"
+      SwitchToggle {
+        theme: root.theme
+        checked: root.cfg.footer
+        onToggled: function(v) { root.update({ footer: v }) }
+      }
+    }
+
+    SettingRow {
+      theme: root.theme
+      label: "Footer actions"
+      dimmed: !root.cfg.footer
       ChipSet {
         theme: root.theme
         options: [{ value: "app", label: "App" }, { value: "open", label: "Open" },
@@ -331,6 +341,7 @@ Column {
     SettingRow {
       theme: root.theme
       label: "Glass opacity"
+      dimmed: root.cfg.style !== "glass"
       Stepper {
         theme: root.theme
         value: root.cfg.glassOpacity
@@ -345,6 +356,7 @@ Column {
     SettingRow {
       theme: root.theme
       label: "Blur behind"
+      dimmed: root.cfg.style !== "glass"
       SwitchToggle {
         theme: root.theme
         checked: root.cfg.blur

@@ -50,7 +50,7 @@ Row {
 
     width: root.theme.px(24)
     height: width
-    radius: root.theme.px(6)
+    radius: root.theme.smallRadius
     color: btnArea.containsMouse && !dimmed ? root.theme.fillHot : root.theme.fill
     opacity: dimmed ? 0.4 : 1
 

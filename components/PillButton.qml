@@ -16,7 +16,7 @@ Rectangle {
 
   width: iconOnly ? height : content.implicitWidth + theme.px(18)
   height: theme.px(26)
-  radius: height / 2
+  radius: theme.round(height)
   color: primary ? theme.accent
     : (active ? theme.accentFill : (area.containsMouse ? theme.fillHot : (iconOnly ? "transparent" : theme.fill)))
 

@@ -11,7 +11,7 @@ Rectangle {
 
   width: row.implicitWidth + theme.px(4)
   height: theme.px(26)
-  radius: theme.px(7)
+  radius: theme.smallRadius
   color: theme.fill
   border.width: theme.hairline
   border.color: theme.line
@@ -30,7 +30,7 @@ Rectangle {
 
         width: segText.implicitWidth + root.theme.px(18)
         height: root.height - root.theme.px(4)
-        radius: root.theme.px(5)
+        radius: root.theme.omarchy ? root.theme.smallRadius : root.theme.px(5)
         color: on ? root.theme.fillHot : (segArea.containsMouse ? root.theme.fill : "transparent")
 
         Behavior on color { ColorAnimation { duration: 120 } }

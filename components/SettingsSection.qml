@@ -11,7 +11,7 @@ Rectangle {
   height: col.implicitHeight
   radius: theme.radius
   color: theme.glass
-  border.width: theme.hairline
+  border.width: theme.borderWidth
   border.color: theme.border
 
   Column {
@@ -27,7 +27,8 @@ Rectangle {
       textFormat: Text.PlainText
       font.family: root.theme.font
       font.pixelSize: root.theme.smallSize
-      color: root.theme.faint
+      font.bold: root.theme.sectionBold
+      color: root.theme.sectionColor
     }
   }
 }

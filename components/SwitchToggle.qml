@@ -10,7 +10,7 @@ Rectangle {
 
   width: theme.px(34)
   height: theme.px(20)
-  radius: height / 2
+  radius: theme.round(height)
   color: checked ? theme.accent : theme.fillHot
 
   Behavior on color { ColorAnimation { duration: 160 } }
@@ -18,7 +18,7 @@ Rectangle {
   Rectangle {
     width: root.theme.px(14)
     height: width
-    radius: width / 2
+    radius: root.theme.round(width)
     y: root.theme.px(3)
     x: root.checked ? root.width - width - root.theme.px(3) : root.theme.px(3)
     color: root.checked ? root.theme.onAccent : root.theme.dim

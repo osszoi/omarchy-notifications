@@ -22,7 +22,8 @@ Rollback: `omarchy plugin disable eduardo.notifications` (or `./uninstall.sh`). 
 
 | Setting | Default |
 |---|---|
-| Style (glass / glass + footer with App, Open, Snooze, Dismiss) | glass |
+| Style: glass (spotlight look) / omarchy (stock look: solid, accent border, Hyprland rounding) | glass |
+| Footer with App, Open, Snooze, Dismiss | off |
 | Timer (bar / ring / none), hide after | bar, 8 s |
 | Critical stays or auto-hides | stays |
 | Group by app, max on screen, collapse duplicates, pause while hovered | on, 4, on, on |

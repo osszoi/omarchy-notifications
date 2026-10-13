@@ -65,7 +65,7 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         width: Math.max(root.theme.px(22), capText.implicitWidth + root.theme.px(12))
         height: root.theme.px(22)
-        radius: root.theme.px(5)
+        radius: root.theme.smallRadius
         color: root.theme.fill
         border.width: root.theme.hairline
         border.color: root.theme.fillHot
