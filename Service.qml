@@ -320,7 +320,32 @@ Item {
   }
 
   function snapshotOf(notification) {
-    return NotificationLogic.snapshotOf(notification, Date.now())
+    return withAppName(NotificationLogic.snapshotOf(notification, Date.now()), notification)
+  }
+
+  // image-path hints come back as image://icon/<path>, which loads square and never
+  // reaches history. a plain file url keeps the aspect ratio and gets persisted
+  function fileUrlOf(value) {
+    var m = /^image:\/\/icon\/(\/.+)$/.exec(String(value || ""))
+    if (!m) return value
+    var path = m[1]
+    try { path = decodeURIComponent(path) } catch (e) {}
+    return "file://" + path
+  }
+
+  // native slack (flatpak) sends no app name, only desktop-entry=com.slack.Slack
+  function withAppName(snapshot, notification) {
+    if (!snapshot) return snapshot
+    snapshot.image = fileUrlOf(snapshot.image)
+    snapshot.appIcon = fileUrlOf(snapshot.appIcon)
+    if (snapshot.app) return snapshot
+    var entryId = ""
+    try { entryId = String(notification.desktopEntry || "") } catch (e) { entryId = "" }
+    if (!entryId) return snapshot
+    var entry = DesktopEntries.byId(entryId)
+    snapshot.app = entry && entry.name ? String(entry.name) : entryId
+    if (!snapshot.appIcon && entry && entry.icon) snapshot.appIcon = String(entry.icon)
+    return snapshot
   }
 
   function isEphemeral(notification) {
@@ -417,7 +442,7 @@ Item {
     writeHistoryFile(written, function() {
       var updated = null
       try {
-        updated = NotificationLogic.replacementSnapshot(notification, written.originalId, written.timestamp)
+        updated = withAppName(NotificationLogic.replacementSnapshot(notification, written.originalId, written.timestamp), notification)
       } catch (e) {
       }
       if (updated && NotificationLogic.popupRowChanged(written, updated)) {
@@ -457,7 +482,7 @@ Item {
 
     var updated
     try {
-      updated = NotificationLogic.replacementSnapshot(notification, originalId, timestamp)
+      updated = withAppName(NotificationLogic.replacementSnapshot(notification, originalId, timestamp), notification)
     } catch (e) {
       return
     }
@@ -802,6 +827,13 @@ Item {
     centerOpen = false
   }
 
+  signal settingsRequested()
+
+  function openSettings() {
+    openCenter()
+    settingsRequested()
+  }
+
   function toggleCenter() {
     if (centerOpen) closeCenter()
     else openCenter()
@@ -829,6 +861,11 @@ Item {
     for (var i = 0; i < rows.length; i++) {
       var row = rowOf(rows[i], t, false)
       row.live = !!liveStems[row.stem]
+      if (row.live) {
+        // persisted copies drop image:// urls, the toast still has the real one
+        var p = indexByStem(popupModel, row.stem)
+        if (p >= 0) row.image = String(popupModel.get(p).image || "")
+      }
       desired.push(row)
       want[row.stem] = true
     }
@@ -1370,6 +1407,11 @@ Item {
       return "closed"
     }
 
+    function openSettings(): string {
+      service.openSettings()
+      return "open"
+    }
+
     function unreadCount(): string {
       return String(service.unread)
     }
@@ -1505,6 +1547,7 @@ Item {
               centerView.forceActiveFocus()
             }
           }
+          function onSettingsRequested() { centerView.view = "settings" }
         }
       }
     }

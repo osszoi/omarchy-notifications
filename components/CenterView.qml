@@ -137,7 +137,7 @@ FocusScope {
         model: root.host.centerModel
         mode: "center"
         groupByApp: root.cfg.groupByApp
-        fadeAfter: 2
+        fadeAfter: 3
         expanded: root.host.centerExpanded
         now: root.host.now
         onCardActivated: function(i) { root.host.centerActivate(i) }

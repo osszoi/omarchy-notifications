@@ -247,7 +247,7 @@ function layout(opts) {
     var g = groups[gi]
     var n = g.indices.length
     var over = maxGroups > 0 && shownGroups >= maxGroups
-    var fade = fadeAfter > 0 && gi >= fadeAfter ? Math.max(0.35, 1 - (gi - fadeAfter + 1) * 0.15) : 1
+    var fade = fadeAfter > 0 && gi >= fadeAfter ? Math.max(0.5, 1 - (gi - fadeAfter + 1) * 0.12) : 1
 
     if (over) {
       for (var k = 0; k < n; k++) {
