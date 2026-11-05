@@ -146,8 +146,29 @@ function glyphFromHints(hints) {
 // clickable (a libnotify action can't — its sender is gone). Run via
 // Util.execArgv as bash positional parameters, never a shell string, so
 // attacker-controlled values (a title, a filename) can't become commands.
-function execArgvFromHints(hints) {
+function execArgvFromHints(hints, appName) {
+  if (appName === "omasnap") {
+    var edit = omasnapEditArgv(stringHint(hints, "omarchy-actions"))
+    if (edit) return edit
+  }
   return stringHint(hints, "omarchy-exec-argv")
+}
+
+// omasnap's card click is Open (xdg-open), we want its Edit button. labels are
+// translated so match the program instead, anything unexpected falls back to Open
+function omasnapEditArgv(actionsJson) {
+  var actions
+  try {
+    actions = JSON.parse(String(actionsJson || ""))
+  } catch (e) {
+    return ""
+  }
+  if (!Array.isArray(actions)) return ""
+  for (var i = 0; i < actions.length; i++) {
+    var argv = actions[i] && actions[i].argv
+    if (Array.isArray(argv) && /(^|\/)omasnap$/.test(String(argv[0] || ""))) return JSON.stringify(argv)
+  }
+  return ""
 }
 
 // Validate a persisted omarchy-exec-argv into a runnable argv, or null. This is
@@ -194,7 +215,7 @@ function snapshotOf(notification, timestamp) {
     body: n.body || "",
     image: n.image || "",
     glyph: glyphFromHints(n.hints),
-    execArgv: execArgvFromHints(n.hints),
+    execArgv: execArgvFromHints(n.hints, n.appName),
     urgency: n.urgency,
     expireTimeout: expireTimeout,
     timestamp: timestamp === undefined ? Date.now() : timestamp
